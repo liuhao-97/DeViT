@@ -1,7 +1,3 @@
-# -*- coding: utf-8 -*-
-# @Time    : 2023/3/14 15:43
-# @Author  : Falcon
-# @FileName: distill_sub.py
 import os
 import json
 import argparse
@@ -206,22 +202,22 @@ def get_args_parser():
 
 
 def get_models(args, num_classes, num_sub, log):
-    # stu_nb = 1000 if args.model_path != '' else num_classes
+    stu_nb = 1000 if args.model_path != '' else num_classes
     model_path = args.model_path if args.finetune else None
     resize_dim = model_config[args.teacher_model]["embed_dim"] if args.distillation_token else None
     model = create_model(
         args.model,
         pretrained=True,
         checkpoint_path=model_path,
-        num_classes=25,
+        num_classes=stu_nb,
         resize_dim=resize_dim,
         drop_rate=args.drop,
         drop_path_rate=args.drop_path,
         drop_block_rate=None,
     )
     log.info(f'Create {args.model} model\n Load ckpt from [PATH]: {model_path}')
-    # if args.model_path != '':
-    #     model.reset_classifier(num_classes=num_classes)
+    if args.model_path != '':
+        model.reset_classifier(num_classes=num_classes)
     model.to(args.device)
 
     teacher_model = None
@@ -408,21 +404,7 @@ def main(args):
 
     if args.neuron_shrinking:
         logger.info('Start shrink neuron')
-        # print('mlp_neuron_rank(model_without_ddp, data_loader_train):',mlp_neuron_rank(model_without_ddp, data_loader_train))
-        ## modified to generate unified mask 
-        # neuron_mask = mlp_neuron_mask(model_without_ddp, neuron_sparsity, mlp_neuron_rank(model_without_ddp, data_loader_train))
-        mlp_hidden_dim = model_without_ddp.blocks[0].mlp.fc1.out_features
-        print(f'mlp_hidden_dim:', mlp_hidden_dim)
-        # 调用新函数生成一致的掩码
-        neuron_mask = generate_consistent_masks(
-            model=model_without_ddp, 
-            data_loader=data_loader_train,
-            rank_function=mlp_neuron_rank,
-            sparsity_ratios=neuron_sparsity,
-            num_elements=mlp_hidden_dim,
-            device=device
-        )
-        
+        neuron_mask = mlp_neuron_mask(model_without_ddp, neuron_sparsity, mlp_neuron_rank(model_without_ddp, data_loader_train))
         print(f'neuron_mask:', neuron_mask)
         for i, t in enumerate(neuron_mask):
             count = torch.sum(t == 1.).item()
@@ -432,113 +414,192 @@ def main(args):
 
     if args.head_shrinking:
         logger.info('Start shrink head')
-        # print('attn_head_rank(model_without_ddp, data_loader_train):', attn_head_rank(model_without_ddp, data_loader_train))
-         ## modified to generate unified mask 
-        # head_mask = attn_head_mask(model_without_ddp, head_sparsity, attn_head_rank(model_without_ddp, data_loader_train))
-        num_heads = model_without_ddp.blocks[0].attn.num_heads
-        print(f'num_heads:', num_heads)
-        # 调用新函数生成一致的掩码
-        head_mask = generate_consistent_masks(
-            model=model_without_ddp,
-            data_loader=data_loader_train,
-            rank_function=attn_head_rank,
-            sparsity_ratios=head_sparsity,
-            num_elements=num_heads,
-            device=device
-        )
+        head_mask = attn_head_mask(model_without_ddp, head_sparsity, attn_head_rank(model_without_ddp, data_loader_train))
         print(f'head_mask:', head_mask)
         for i, t in enumerate(head_mask):
             count = torch.sum(t == 1.).item()
             length = t.numel()  # or len(t) since they are 1D tensors
             print(f"head Tensor {i+1}: {count} ones out of {length} elements")
-        attn_head_shrink(model_without_ddp, head_mask)
 
-    logger.info(f"Start training for {args.epochs} epochs in sub-dataset{args.start_division}")
-    output_dir = Path(os.path.join(args.output_dir, f'sub-dataset{args.start_division}'))
-    os.makedirs(output_dir, exist_ok=True)
+        attn_head_shrink(model_without_ddp, head_mask)
+    
+
+    output_dir = f'output_imagenet/cifar100_div4/deit_base_distilled_patch16_224/distill_sub/lr8e-05-bs256-epochs10-grad1.0-wd0-wm5-gama0.2_0.1_0.3/sub-dataset{args.start_division}'
+    # model_to_test = create_model(
+    #     args.model,
+    #     pretrained=True,
+    #     checkpoint_path=os.path.join(output_dir, 'checkpoint.pth'),
+    #     num_classes=25,
+    #     drop_rate=args.drop,
+    #     drop_path_rate=args.drop_path,
+    #     drop_block_rate=None,
+    # )
+    # model_to_test.to(args.device)
+    # mlp_neuron_shrink(model_to_test, neuron_mask)
+    # attn_head_shrink(model_to_test, head_mask)
+    # test_stats = evaluate(data_loader=data_loader_val, model=model_to_test, device=args.device)
+    # print(test_stats)
     
     # neuron_mask_np = np.stack([mask.cpu().numpy() for mask in neuron_mask])
     # head_mask_np = np.stack([mask.cpu().numpy() for mask in head_mask])
     # np.save(os.path.join(output_dir, 'neuron_mask'), neuron_mask_np)
     # np.save(os.path.join(output_dir, 'head_mask'), head_mask_np)
 
-    # init tensorboard
-    writer = SummaryWriter(log_dir=output_dir) if get_rank() == 0 else None
-
-    # for samples, targets in data_loader_train:
-    #     samples = samples.to(device, non_blocking=True)
-    # student_outputs = model(samples, output_qkv=True)
-    # print(student_outputs.keys())
-
-    # for samples, targets in data_loader_train:
-    #     samples = samples.to(device, non_blocking=True)
-    # teacher_outputs = teacher_model(samples, output_qkv=True)
-    # print(teacher_outputs.keys())
+    loaded_neuron_mask_np = np.load(os.path.join(output_dir, 'neuron_mask.npy'))
+    # recover back to PyTorch tensor list：
+    loaded_neuron_mask = [torch.from_numpy(arr) for arr in loaded_neuron_mask_np]
+    loaded_head_mask_np = np.load(os.path.join(output_dir, 'head_mask.npy'))
+    loaded_head_mask = [torch.from_numpy(arr) for arr in loaded_head_mask_np]
+    print('loaded_neuron_mask:', loaded_neuron_mask)
+    print('loaded_head_mask:', loaded_head_mask)
     
-    start_time = time.time()
-    max_accuracy = 0.0
-    for epoch in range(args.start_epoch, args.epochs):
-        if args.distributed:
-            data_loader_train.sampler.set_epoch(epoch)
 
-        train_stats = train_1epoch_qkv(model=model, teacher_model=teacher_model, criterion=criterion, args=args,
-                                       data_loader=data_loader_train, optimizer=optimizer, device=args.device,
-                                       epoch=epoch, loss_scaler=loss_scaler, log=logger, max_norm=args.clip_grad,
-                                       model_ema=model_ema, mixup_fn=mixup_fn)
+    model_to_retest = create_model(
+        args.model,
+        pretrained=True,
+        checkpoint_path=os.path.join(output_dir, 'checkpoint.pth'),
+        num_classes=25,
+        drop_rate=args.drop,
+        drop_path_rate=args.drop_path,
+        drop_block_rate=None,
+    )
+    model_to_retest.to(args.device)
+    mlp_neuron_shrink(model_to_retest, loaded_neuron_mask)
+    attn_head_shrink(model_to_retest, loaded_head_mask)
+    test_stats = evaluate(data_loader=data_loader_val, model=model_to_retest, device=args.device)
+    print(test_stats)
 
-        lr_scheduler.step(epoch)
-        if args.output_dir:
-            checkpoint_paths = [output_dir / 'checkpoint_temp.pth']
-            for checkpoint_path in checkpoint_paths:
-                dist_utils.save_on_master({
-                    'model': model_without_ddp.state_dict(),
-                    'optimizer': optimizer.state_dict(),
-                    'lr_scheduler': lr_scheduler.state_dict(),
-                    'epoch': epoch,
-                    'model_ema': get_state_dict(model_ema),
-                    'scaler': loss_scaler.state_dict(),
-                    'args': args,
-                }, checkpoint_path)
+    # dedeit_model = create_model(
+    #     'dedeit_pruned',
+    #     num_classes=25,
+    #     drop_rate=args.drop,
+    #     drop_path_rate=args.drop_path,
+    #     drop_block_rate=None,
+    # )
+    # print(dedeit_model)
+    # print("Starting parameter transfer from the pruned model to the new compact model...")
 
-        test_stats = evaluate(data_loader=data_loader_val, model=model, device=args.device)
-        logger.info(f"Epoch: {epoch}/{args.epochs} \t [Train] Loss: {train_stats['loss']:.4f} \t ")
-        logger.info(f"Epoch: {epoch}/{args.epochs} \t [Eval] Top-1: {test_stats['acc1']:.4f} \t "
-                    f"Top-5: {test_stats['acc5']:.4f} \t Loss: {test_stats['loss']:.4f} \t ")
-        if writer is not None:
-            writer.add_scalar('Train/loss', train_stats['loss'], epoch)
-            writer.add_scalar('Train/lr', train_stats['lr'], epoch)
-            writer.add_scalar('Test/loss', test_stats['loss'], epoch)
-            writer.add_scalar('Test/Top1', test_stats['acc1'], epoch)
-            writer.add_scalar('Test/Top5', test_stats['acc5'], epoch)
+    # # 1. 获取两个模型的参数字典
+    # state_dict_old = model_to_retest.state_dict()
+    # state_dict_new_template = dedeit_model.state_dict()
 
-        if max_accuracy < test_stats["acc1"]:
-            max_accuracy = test_stats["acc1"]
-            if args.output_dir and dist_utils.is_main_process():
-                model_checkpoint = os.path.join(output_dir, f"checkpoint.pth")
-                torch.save(model_without_ddp.state_dict(), model_checkpoint)
-                torch.save(args, os.path.join(output_dir, 'training_args.bin'))
-                with open(os.path.join(output_dir, 'result.txt'), 'w') as f:
-                    f.write(f'Final Accuracy: {max_accuracy}\n'
-                            f'Model config: {model_config}')
-                logger.info(f'Saving model in [PATH]: {output_dir}')
-        logger.info(f'Max accuracy: {max_accuracy:.4f}%')
+    # # 创建一个新的字典来存储转换后的参数
+    # new_state_dict = {}
 
-        log_stats = {**{f'train_{k}': v for k, v in train_stats.items()},
-                     **{f'test_{k}': v for k, v in test_stats.items()},
-                     'epoch': epoch,
-                     'n_parameters': n_parameters}
+    # # 2. 定义模型维度以便于理解
+    # old_dim = model_to_retest.embed_dim  # 768
+    # new_dim = dedeit_model.embed_dim    # 192
+    # head_dim =  64 # 64, 每个注意力头的维度保持不变
+    # print(f'old_dim: {old_dim}, new_dim: {new_dim}, head_dim: {head_dim}')
 
-        if args.output_dir and dist_utils.is_main_process():
-            with (output_dir / "log.txt").open("a") as f:
-                f.write(json.dumps(log_stats) + "\n")
+    # # 3. 遍历新模型的每一层，为其填充参数
+    # for key in state_dict_new_template.keys():
+    #     param_old = state_dict_old[key]
 
-        total_time = time.time() - start_time
-        total_time_str = str(datetime.timedelta(seconds=int(total_time)))
-        logger.info(f'Epochs: {epoch} \t Training time: {total_time_str} ')
+    #     # ----------------------------------------------------------------
+    #     # A. 处理 Transformer Blocks 内部的参数
+    #     # ----------------------------------------------------------------
+    #     if 'blocks.' in key:
+    #         block_idx = int(key.split('.')[1])
+            
+    #         # 获取当前block对应的mask和保留下来的索引
+    #         kept_head_indices = torch.where(head_mask[block_idx] == 1)[0]
+    #         kept_neuron_indices = torch.where(neuron_mask[block_idx] == 1)[0]
+            
+    #         # --- Attention QKV (最复杂的部分) ---
+    #         if 'attn.qkv.weight' in key:
+    #             # 原始尺寸: (old_dim * 3, old_dim) -> (2304, 768)
+    #             # 目标尺寸: (new_dim * 3, new_dim) -> (576, 192)
+    #             W_q, W_k, W_v = torch.chunk(param_old, 3, dim=0)
+                
+    #             # 分别提取q, k, v中被保留的头的权重，并且只选择新的输入维度
+    #             W_q_new = torch.cat([W_q[h_idx*head_dim:(h_idx+1)*head_dim, :new_dim] for h_idx in kept_head_indices], dim=0)
+    #             W_k_new = torch.cat([W_k[h_idx*head_dim:(h_idx+1)*head_dim, :new_dim] for h_idx in kept_head_indices], dim=0)
+    #             W_v_new = torch.cat([W_v[h_idx*head_dim:(h_idx+1)*head_dim, :new_dim] for h_idx in kept_head_indices], dim=0)
 
-    total_time = time.time() - start_time
-    total_time_str = str(datetime.timedelta(seconds=int(total_time)))
-    logger.info(f'Training time {total_time_str} on sub-dataset{args.start_division}')
+    #             new_state_dict[key] = torch.cat([W_q_new, W_k_new, W_v_new], dim=0)
+    #             continue
+
+    #         if 'attn.qkv.bias' in key:
+    #             b_q, b_k, b_v = torch.chunk(param_old, 3, dim=0)
+    #             b_q_new = torch.cat([b_q[h_idx*head_dim:(h_idx+1)*head_dim] for h_idx in kept_head_indices], dim=0)
+    #             b_k_new = torch.cat([b_k[h_idx*head_dim:(h_idx+1)*head_dim] for h_idx in kept_head_indices], dim=0)
+    #             b_v_new = torch.cat([b_v[h_idx*head_dim:(h_idx+1)*head_dim] for h_idx in kept_head_indices], dim=0)
+    #             new_state_dict[key] = torch.cat([b_q_new, b_k_new, b_v_new], dim=0)
+    #             continue
+            
+    #         # --- Attention Projection ---
+    #         if 'attn.proj.weight' in key:
+    #             # 原始尺寸: (old_dim, old_dim) -> (768, 768)
+    #             # 目标尺寸: (new_dim, new_dim) -> (192, 192)
+    #             # 1. 选择输出维度 (行)
+    #             w_new = param_old[:new_dim, :]
+    #             # 2. 根据保留的头选择输入维度 (列)
+    #             w_new = torch.cat([w_new[:, h_idx*head_dim:(h_idx+1)*head_dim] for h_idx in kept_head_indices], dim=1)
+    #             new_state_dict[key] = w_new
+    #             continue
+
+    #         # --- MLP (Feed-Forward Network) ---
+    #         if 'mlp.fc1.weight' in key:
+    #             # 原始尺寸: (old_dim * mlp_ratio, old_dim) -> (3072, 768)
+    #             # 目标尺寸: (new_dim * mlp_ratio, new_dim) -> (768, 192)
+    #             # 1. 根据保留的神经元选择输出维度 (行)
+    #             w_new = param_old[kept_neuron_indices, :]
+    #             # 2. 选择输入维度 (列)
+    #             new_state_dict[key] = w_new[:, :new_dim]
+    #             continue
+            
+    #         if 'mlp.fc2.weight' in key:
+    #             # 原始尺寸: (old_dim, old_dim * mlp_ratio) -> (768, 3072)
+    #             # 目标尺寸: (new_dim, new_dim * mlp_ratio) -> (192, 768)
+    #             # 1. 选择输出维度 (行)
+    #             w_new = param_old[:new_dim, :]
+    #             # 2. 根据保留的神经元选择输入维度 (列)
+    #             new_state_dict[key] = w_new[:, kept_neuron_indices]
+    #             continue
+
+    #         # --- 处理 Block 内部所有其他参数 (Norms, Biases) ---
+    #         if 'bias' in key or 'norm' in key:
+    #             # 偏置参数跟随其权重矩阵的 "行" 选择逻辑
+    #             if 'attn.proj.bias' in key or 'mlp.fc2.bias' in key or 'norm' in key:
+    #                 new_state_dict[key] = param_old[:new_dim]
+    #             elif 'mlp.fc1.bias' in key:
+    #                 new_state_dict[key] = param_old[kept_neuron_indices]
+    #             continue
+
+    #     # ----------------------------------------------------------------
+    #     # B. 处理非 Block 的参数 (Embeddings, Final Norm, Head)
+    #     # ----------------------------------------------------------------
+    #     if 'head' in key: # 分类头
+    #         if 'weight' in key:
+    #             new_state_dict[key] = param_old[:, :new_dim]
+    #         else: # bias
+    #             new_state_dict[key] = param_old # 偏置维度不变
+    #         continue
+            
+    #     # 适用于 patch_embed, cls_token, dist_token, pos_embed, 和最后的 norm 层
+    #     # 它们的维度都是从 old_dim (768) 降到 new_dim (192)
+    #     if 'weight' in key or 'bias' in key: # PatchEmbed's proj, final Norm
+    #         new_state_dict[key] = param_old[:new_dim]
+    #     elif param_old.dim() > 1: # Embeddings (pos_embed, cls_token, etc.)
+    #         new_state_dict[key] = param_old[:, :, :new_dim]
+    #     else: # Fallback for 1D params not caught
+    #         new_state_dict[key] = param_old[:new_dim]
+            
+    # # 4. 将填充好的参数字典加载到新模型中
+    # dedeit_model.load_state_dict(new_state_dict)
+    
+    # print("\nParameter transfer complete!")
+    # print("Verifying a few key parameter shapes:")
+    # print(f"  - New model's QKV weight (block 0): {dedeit_model.state_dict()['blocks.0.attn.qkv.weight'].shape}")
+    # print(f"  - New model's MLP fc1 weight (block 0): {dedeit_model.state_dict()['blocks.0.mlp.fc1.weight'].shape}")
+
+    # # (可选) 再次评估新模型，确认性能是否符合预期
+    # dedeit_model.to(args.device)
+    # print("\nEvaluating the new compact model after parameter transfer...")
+    # test_stats_new = evaluate(data_loader=data_loader_val, model=dedeit_model, device=args.device)
+    # print(f"Stats for the new compact dedeit_model: {test_stats_new}")
+    
 
 
 if __name__ == '__main__':

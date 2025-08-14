@@ -1,50 +1,49 @@
-# -*- coding: utf-8 -*-
-# @Time    : 2022/4/27 21:35
-# @Author  : Falcon
-# @FileName: train_subdata.py
 import os
+import json
 import argparse
-import sys
 import datetime
-import numpy as np
-import math
-from typing import Iterable, Optional
 import time
-from functools import partial
+import numpy as np
 import torch
 import torch.backends.cudnn as cudnn
 from torch.utils.tensorboard import SummaryWriter
-import json
-
 from pathlib import Path
 
 from timm.data import Mixup
 from timm.models import create_model
-from timm.loss import LabelSmoothingCrossEntropy, SoftTargetCrossEntropy
 from timm.scheduler import create_scheduler
 from timm.optim import create_optimizer
-from timm.utils import NativeScaler, ModelEma, accuracy
+from timm.utils import NativeScaler, ModelEma, get_state_dict
+from timm.loss import LabelSmoothingCrossEntropy, SoftTargetCrossEntropy
+
+from engine import evaluate, train_1epoch_qkv
+from data.get_dataset import build_division_dataset
+
 
 import models.de_vit
-from data.get_dataset import build_division_dataset
+from models.de_vit import model_config
+from core.imp_rank import *
 from utils import dist_utils
 from utils.samplers import RASampler
 from utils.logger import create_logger
-from utils.losses import DistillationLoss
-from utils.dist_utils import get_rank, get_world_size, init_distributed_mode
+from utils.losses import DistillLoss
+from utils.dist_utils import get_rank, get_world_size
 
+from models.de_vit import VisionTransformer
 
 def get_args_parser():
-    parser = argparse.ArgumentParser('DeViT training and evaluation script', add_help=False)
+    parser = argparse.ArgumentParser('ViT training and evaluation script', add_help=False)
     parser.add_argument('--batch-size', default=2, type=int)
     parser.add_argument('--eval-batch-size', default=512, type=int)
     parser.add_argument('--epochs', default=5, type=int)
+    parser.add_argument('--output_dir', default=r'./output',
+                        help='path where to save, empty for no saving')
+    parser.add_argument('--finetune', action='store_true', help="Whether to finetune")
 
     # Model parameters
-    parser.add_argument('--model', default='deit_base_distilled_patch16_224', type=str, metavar='MODEL',
+    parser.add_argument('--model', default='dedeit', type=str, metavar='MODEL',
                         help='Name of model to train')
-    parser.add_argument('--model-path', type=str,
-                        default=r'./model_path')
+    parser.add_argument('--model-path', type=str, default='')
     parser.add_argument('--input-size', default=224, type=int, help='images input size')
 
     parser.add_argument('--drop', type=float, default=0.0, metavar='PCT',
@@ -65,7 +64,7 @@ def get_args_parser():
                         help='Optimizer Epsilon (default: 1e-8)')
     parser.add_argument('--opt-betas', default=None, type=float, nargs='+', metavar='BETA',
                         help='Optimizer Betas (default: None, use opt default)')
-    parser.add_argument('--clip-grad', type=float, default=None, metavar='NORM',
+    parser.add_argument('--clip-grad', type=float, default=1.0, metavar='NORM',
                         help='Clip gradient norm (default: None, no clipping)')
     parser.add_argument('--momentum', type=float, default=0.9, metavar='M',
                         help='SGD momentum (default: 0.9)')
@@ -110,7 +109,7 @@ def get_args_parser():
     parser.add_argument('--repeated-aug', action='store_true')
     parser.add_argument('--no-repeated-aug', action='store_false', dest='repeated_aug')
     parser.set_defaults(repeated_aug=True)
-    parser.add_argument('--no-aug', action='store_true', help='not use aug')
+    parser.add_argument('--no_aug', action='store_true', help="no aug")
 
     # * Random Erase params
     parser.add_argument('--reprob', type=float, default=0.25, metavar='PCT',
@@ -137,21 +136,31 @@ def get_args_parser():
                         help='How to apply mixup/cutmix params. Per "batch", "pair", or "elem"')
 
     # Distillation parameters
-    parser.add_argument('--teacher-model', default='deit_base_distilled_patch16_224', type=str, metavar='MODEL',
+    parser.add_argument('--teacher-model', default='vit_large_patch16_224', type=str, metavar='MODEL',
                         help='Name of teacher model to train')
     parser.add_argument('--teacher-path', type=str,
-                        default=r'./teacher_path')
-    parser.add_argument('--distillation-type', default='none', choices=['none', 'soft', 'hard'], type=str, help="")
+                        default=r'./teacher_ckpt')
+    parser.add_argument('--distillation-type', default='hard', choices=['none', 'soft', 'hard'], type=str, help="")
+    parser.add_argument('--distillation-inter', type=bool, default=True,
+                        help="Whether to distill intermediate features")
+    # parser.add_argument('--distillation-token', type=bool, default=True, help="Whether to distill token")
     parser.add_argument('--distillation-token', action='store_true', help="Whether to distill token")
     parser.add_argument('--distillation-alpha', default=0.5, type=float, help="")
     parser.add_argument('--distillation-tau', default=1.0, type=float, help="")
+    # Loss parameters
+    parser.add_argument('--gama', nargs='+', default=[0.2, 0.1, 0.3], help="paras to adjust loss")
 
     # Dataset parameters
-    parser.add_argument('--data-path', default=r'./datsets',
+    parser.add_argument('--data-path', default=r'./datasets',
                         type=str,
                         help='dataset path')
     parser.add_argument('--dataset', default='cifar100', choices=['cifar100', 'IMNET', 'cars', 'pets', 'flowers'],
                         type=str, help='Image Net dataset path')
+    parser.add_argument('--inat-category', default='name',
+                        choices=['kingdom', 'phylum', 'class', 'order', 'supercategory', 'family', 'genus', 'name'],
+                        type=str, help='semantic granularity')
+
+    # Division parameters
     parser.add_argument('--num_division', metavar='N',
                         type=int,
                         default=4,
@@ -160,12 +169,8 @@ def get_args_parser():
                         type=int,
                         default=0,
                         help='The number of sub models')
-    parser.add_argument('--inat-category', default='name',
-                        choices=['kingdom', 'phylum', 'class', 'order', 'supercategory', 'family', 'genus', 'name'],
-                        type=str, help='semantic granularity')
 
-    parser.add_argument('--output_dir', default='./output',
-                        help='path where to save, empty for no saving')
+    # Others
     parser.add_argument('--device', default='cuda',
                         help='device to use for training / testing')
     parser.add_argument('--seed', default=0, type=int)
@@ -188,161 +193,211 @@ def get_args_parser():
                         help='number of distributed processes')
     parser.add_argument('--dist_url', default='env://', help='url used to set up distributed training')
 
+    # shrink
+    parser.add_argument('--load_shrink', action='store_true', default=False)
+    parser.add_argument('--shrink_checkpoint', type=str, default='')
+    parser.add_argument('--neuron_shrinking', action='store_true', default=False)
+    parser.add_argument('--head_shrinking', action='store_true', default=False)
+
+    # args = parser.parse_args()
     return parser
 
 
 def get_models(args, num_classes, num_sub, log):
-    if args.model_path == '':
-        model_path = None
-    else:
-        model_path = args.model_path
-        num_classes = 1000
-    
-    print('num_classes:', num_classes)
-
+    stu_nb = 1000 if args.model_path != '' else num_classes
+    model_path = args.model_path if args.finetune else None
+    resize_dim = model_config[args.teacher_model]["embed_dim"] if args.distillation_token else None
     model = create_model(
         args.model,
         pretrained=True,
         checkpoint_path=model_path,
-        num_classes=num_classes,
+        num_classes=stu_nb,
+        resize_dim=resize_dim,
         drop_rate=args.drop,
         drop_path_rate=args.drop_path,
         drop_block_rate=None,
     )
     log.info(f'Create {args.model} model\n Load ckpt from [PATH]: {model_path}')
     if args.model_path != '':
-        model.reset_classifier(num_classes=args.num_classes)
+        model.reset_classifier(num_classes=num_classes)
     model.to(args.device)
-
-    print(model)
 
     teacher_model = None
     if args.distillation_type != 'none':
         teacher_path = os.path.join(args.teacher_path, f'sub-dataset{num_sub}', 'checkpoint.pth')
+        if not os.path.exists(teacher_path):
+            raise ValueError(f'Teacher model path {teacher_path} does not exist. Please check the path.')
+        else:
+            print(f'Load teacher model from [PATH]: {teacher_path}')
+
         teacher_ckpt = torch.load(teacher_path, map_location='cpu')
         teacher_model = create_model(args.teacher_model,
                                      num_classes=num_classes,
                                      drop_rate=args.drop,
                                      drop_path_rate=args.drop_path,
                                      drop_block_rate=None, )
-        if args.dataset != 'IMNET':
-            teacher_model.load_state_dict(teacher_ckpt)
-        else:
-            teacher_model.load_state_dict(teacher_ckpt['model'])
+        teacher_model.load_state_dict(teacher_ckpt)
         teacher_model.to(args.device)
         teacher_model.eval()
 
     return model, teacher_model
 
 
-def train_one_epoch(model: torch.nn.Module, criterion, data_loader: Iterable, optimizer: torch.optim.Optimizer,
-                    device: torch.device, epoch: int, loss_scaler, log, max_norm: float = 0,
-                    model_ema: Optional[ModelEma] = None, mixup_fn: Optional[Mixup] = None):
-    model.train(mode=True)
-    metric_logger = dist_utils.MetricLogger(delimiter="  ")
-    metric_logger.add_meter('lr', dist_utils.SmoothedValue(window_size=1, fmt='{value:.6f}'))
-    if args.distillation_token:
-        metric_logger.add_meter('cls_loss', dist_utils.SmoothedValue(window_size=1, fmt='{value:.6f}'))
-        metric_logger.add_meter('token_loss', dist_utils.SmoothedValue(window_size=1, fmt='{value:.6f}'))
-    header = 'Epoch: [{}]'.format(epoch)
-    print_freq = 10
+def generate_compact_model(pruned_model: VisionTransformer):
+    """
+    根据一个带有gate掩码的大模型，生成一个物理上更紧凑的新模型。
+    """
+    print("Step 2: 正在分析 'gate' 并创建紧凑模型...")
+    
+    # --- 分析Gate，确定新架构 ---
+    # 假设所有层的剪枝率相同，所以只看第一个block
+    first_block = pruned_model.blocks[0]
+    
+    # 保留的注意力头索引
+    head_mask = first_block.attn.gate.bool()
+    print(f"注意力头掩码: {head_mask}\n")
+    new_num_heads = int(head_mask.sum())
+    
+    # 保留的MLP神经元索引
+    neuron_mask = first_block.mlp.gate.bool()
+    new_mlp_hidden_dim = int(neuron_mask.sum())
+    
+    # 获取原始模型的配置
+    embed_dim = 768
+    depth = len(pruned_model.blocks)
+    patch_size = pruned_model.patch_embed.patch_size[0]
+    num_classes = pruned_model.num_classes
+    
+    # 计算新的 mlp_ratio
+    # Mlp hidden_dim = embed_dim * mlp_ratio
+    # new_mlp_ratio = new_mlp_hidden_dim / embed_dim
+    new_mlp_ratio = 4
 
-    for samples, targets in metric_logger.log_every(data_loader, print_freq, header):
-        samples = samples.to(device, non_blocking=True)
-        targets = targets.to(device, non_blocking=True)
+    print(f"新模型架构确定: embed_dim={embed_dim}, depth={depth}, num_heads={new_num_heads}, new_mlp_ratio={new_mlp_ratio:.4f}\n")
 
-        if mixup_fn is not None:
-            samples, targets = mixup_fn(samples, targets)
+    # --- 创建新的紧凑模型实例 ---
+    compact_model = VisionTransformer(
+        patch_size=16,
+        embed_dim=768,
+        depth=12,
+        num_heads=3,
+        mlp_ratio=1,
+        qkv_bias=True,
+        norm_layer=torch.nn.LayerNorm,
+        distilled=True,
+        num_classes=num_classes
+    )
+    
+    print("Step 3: 正在进行权重迁移...")
+    
+    # --- 权重迁移 ---
+    pruned_sd = pruned_model.state_dict()
+    compact_sd = compact_model.state_dict()
+    # print(compact_sd)
+    print(compact_sd.keys())
+    # 迁移与剪枝无关的权重
+    for name in compact_sd.keys():
+        if 'attn.' not in name and 'mlp.' not in name:
+            if name in pruned_sd:
+                if compact_sd[name].shape != pruned_sd[name].shape:
+                    print(f"警告: {name} 的形状不匹配！")
+                else:
+                    compact_sd[name].copy_(pruned_sd[name])
 
-        with torch.cuda.amp.autocast():
-            if args.distillation_token:
-                output_token, outputs = model(samples, True)
-                cls_loss, token_loss = criterion(inputs=samples, outputs=outputs, labels=targets,
-                                                 token_outputs=output_token)
-                loss = cls_loss + token_loss
-                metric_logger.update(cls_loss=cls_loss.item())
-                metric_logger.update(token_loss=token_loss.item())
-            else:
-                outputs = model(samples)
-                loss = criterion(inputs=samples, outputs=outputs, labels=targets)
+    # 迁移剪枝相关的权重（核心部分）
+    head_dim = embed_dim // new_num_heads
 
-        loss_value = loss.item()
+    for i in range(depth):
+        p_b = f'blocks.{i}.' # pruned_block_prefix
+        c_b = f'blocks.{i}.' # compact_block_prefix
+        
+        # --- 迁移 Attention 权重 ---
+        # qkv 权重和偏置
+        # 原始qkv权重形状: (embed_dim*3, embed_dim)
+        # 我们需要按头来选择权重
+        qkv_weight = pruned_sd[p_b + 'attn.qkv.weight']
+        qkv_bias = pruned_sd[p_b + 'attn.qkv.bias']
+        
+        # q, k, v 各自的权重和偏置
+        q_w, k_w, v_w = qkv_weight.chunk(3, dim=0)
+        q_b, k_b, v_b = qkv_bias.chunk(3, dim=0)
 
-        if not math.isfinite(loss_value):
-            log.info("Loss is {}, stopping training".format(loss_value))
-            sys.exit(1)
+        # 按头进行切片
+        # 原始每个头的维度
+        old_head_dim = pruned_model.embed_dim // pruned_model.blocks[0].attn.num_heads
+        
+        # 选择有效的头
+        compact_q_w = q_w.reshape(pruned_model.blocks[0].attn.num_heads, old_head_dim, embed_dim)[head_mask]
+        compact_k_w = k_w.reshape(pruned_model.blocks[0].attn.num_heads, old_head_dim, embed_dim)[head_mask]
+        compact_v_w = v_w.reshape(pruned_model.blocks[0].attn.num_heads, old_head_dim, embed_dim)[head_mask]
+        
+        compact_q_b = q_b.reshape(pruned_model.blocks[0].attn.num_heads, old_head_dim)[head_mask]
+        compact_k_b = k_b.reshape(pruned_model.blocks[0].attn.num_heads, old_head_dim)[head_mask]
+        compact_v_b = v_b.reshape(pruned_model.blocks[0].attn.num_heads, old_head_dim)[head_mask]
 
-        optimizer.zero_grad()
+        # 重新组合成紧凑的qkv权重
+        compact_sd[c_b + 'attn.qkv.weight'] = torch.cat([
+            compact_q_w.reshape(-1, embed_dim), 
+            compact_k_w.reshape(-1, embed_dim), 
+            compact_v_w.reshape(-1, embed_dim)
+        ], dim=0)
+        compact_sd[c_b + 'attn.qkv.bias'] = torch.cat([
+            compact_q_b.flatten(), 
+            compact_k_b.flatten(), 
+            compact_v_b.flatten()
+        ], dim=0)
 
-        # this attribute is added by timm on one optimizer (adahessian)
-        is_second_order = hasattr(optimizer, 'is_second_order') and optimizer.is_second_order
-        loss_scaler(loss, optimizer, clip_grad=max_norm, parameters=model.parameters(),
-                    create_graph=is_second_order)
+        # proj 权重和偏置
+        # proj 的输入维度需要被剪枝
+        compact_sd[c_b + 'attn.proj.weight'] = pruned_sd[p_b + 'attn.proj.weight'][:, head_mask.repeat_interleave(old_head_dim)]
+        compact_sd[c_b + 'attn.proj.bias'] = pruned_sd[p_b + 'attn.proj.bias']
+        
+        # --- 迁移 MLP 权重 ---
+        # fc1: 输出维度被剪枝 (选择行)
+        compact_sd[c_b + 'mlp.fc1.weight'] = pruned_sd[p_b + 'mlp.fc1.weight'][neuron_mask]
+        compact_sd[c_b + 'mlp.fc1.bias'] = pruned_sd[p_b + 'mlp.fc1.bias'][neuron_mask]
 
-        torch.cuda.synchronize()
-        if model_ema is not None:
-            model_ema.update(model)
+        # fc2: 输入维度被剪枝 (选择列)
+        compact_sd[c_b + 'mlp.fc2.weight'] = pruned_sd[p_b + 'mlp.fc2.weight'][:, neuron_mask]
+        compact_sd[c_b + 'mlp.fc2.bias'] = pruned_sd[p_b + 'mlp.fc2.bias']
 
-        metric_logger.update(loss=loss_value)
-        metric_logger.update(lr=optimizer.param_groups[0]["lr"])
-    # gather the stats from all processes
-    metric_logger.synchronize_between_processes()
-    log.info(f"Averaged stats: {metric_logger}")
-    return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
+    # 加载新的state_dict
+    compact_model.load_state_dict(compact_sd)
+    print("权重迁移完成！\n")
+    return compact_model
 
-
-@torch.no_grad()
-def evaluate(data_loader, model, device):
-    criterion = torch.nn.CrossEntropyLoss()
-
-    metric_logger = dist_utils.MetricLogger(delimiter="  ")
-    header = 'Test:'
-
-    # switch to evaluation mode
-    model.eval()
-
-    for images, target in metric_logger.log_every(data_loader, 10, header):
-        images = images.to(device, non_blocking=True)
-        target = target.to(device, non_blocking=True)
-
-        # compute output
-        with torch.cuda.amp.autocast():
-            output = model(images)
-            loss = criterion(output, target)
-
-        acc1, acc5 = accuracy(output, target, topk=(1, 5))
-
-        batch_size = images.shape[0]
-        metric_logger.update(loss=loss.item())
-        metric_logger.meters['acc1'].update(acc1.item(), n=batch_size)
-        metric_logger.meters['acc5'].update(acc5.item(), n=batch_size)
-    # gather the stats from all processes
-    metric_logger.synchronize_between_processes()
-
-    return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
 
 
 def main(args):
-    init_distributed_mode(args)
+    dist_utils.init_distributed_mode(args)
+
+    # Create output path
+    args.method = f'distill_sub'
+    args.name = f'lr{args.lr}-bs{args.batch_size}-epochs{args.epochs}-grad{args.clip_grad}' \
+                f'-wd{args.weight_decay}-wm{args.warmup_epochs}-gama{args.gama[0]}_{args.gama[1]}_{args.gama[2]}'
+    args.output_dir = os.path.join(args.output_dir, f'{args.dataset}_div{args.num_division}', f'{args.model}',
+                                   args.method, args.name)
+    if args.output_dir:
+        Path(args.output_dir).mkdir(parents=True, exist_ok=True)
 
     # log init
-    logger = create_logger(output_dir=args.output_dir, dist_rank=get_rank(), name=f"{args.method}")
+    logger = create_logger(output_dir=args.output_dir, dist_rank=dist_utils.get_rank(), name=f"{args.method}")
     logger.info(args)
 
-    args.device = torch.device(args.device)
+    device = torch.device(args.device)
 
     # fix the seed for reproducibility
-    seed = args.seed + get_rank()
+    seed = args.seed + dist_utils.get_rank()
     torch.manual_seed(seed)
     np.random.seed(seed)
+
     cudnn.benchmark = True
 
     # Load dataset
     sub_dataset_path = os.path.join(args.data_path, f'sub-dataset{args.start_division}')
+
     train_dataset, test_dataset, division_num_classes = build_division_dataset(dataset_path=sub_dataset_path, args=args)
     args.num_classes = division_num_classes
-    print('division_num_classes:', division_num_classes)
-    print('sub_dataset_path:', sub_dataset_path)
 
     num_tasks = get_world_size()
     global_rank = get_rank()
@@ -389,15 +444,11 @@ def main(args):
             mixup_alpha=args.mixup, cutmix_alpha=args.cutmix, cutmix_minmax=args.cutmix_minmax,
             prob=args.mixup_prob, switch_prob=args.mixup_switch_prob, mode=args.mixup_mode,
             label_smoothing=args.smoothing, num_classes=division_num_classes)
-    print('mixup_active:', mixup_active)
-    
-    logger.info(f"Creating model: {args.model}")
-    model, teacher_model = get_models(args=args, num_classes=division_num_classes, num_sub=args.start_division, log=logger)
-    
-    print('division_num_classes:', division_num_classes)
 
+    model, teacher_model = get_models(args, division_num_classes, args.start_division, logger)
+    print('student deit model:', model)
     model_ema = None
-    if args.model_ema:  # Exponential Moving Average, for model smoothing
+    if args.model_ema:
         # Important to create EMA model after cuda(), DP wrapper, and AMP but before SyncBN and DDP wrapper
         model_ema = ModelEma(
             model,
@@ -405,11 +456,9 @@ def main(args):
             device='cpu' if args.model_ema_force_cpu else '',
             resume='')
 
-    print("args.model_ema:", args.model_ema)
-
     model_without_ddp = model
     if args.distributed:
-        model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu],find_unused_parameters=True)
+        model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu])
         model_without_ddp = model.module
     n_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
     logger.info(f'number of params: {n_parameters}')
@@ -432,99 +481,65 @@ def main(args):
 
     # wrap the criterion in our custom DistillationLoss, which
     # just dispatches to the original criterion if args.distillation_type is 'none'
-    criterion = DistillationLoss(
-        criterion, teacher_model, args.distillation_type, args.distillation_alpha, args.distillation_tau,
-        args.distillation_token)
+    criterion = DistillLoss(base_criterion=criterion, distillation_type=args.distillation_type,
+                            alpha=args.distillation_alpha, tau=args.distillation_tau)
 
-    if args.eval:
-        test_stats = evaluate(data_loader_val, model, args.device)
-        logger.info(f"Accuracy of the network on the {len(test_dataset)} test images: {test_stats['acc1']:.1f}%")
-        return
+   
+    # load shrink
+    if args.shrink_checkpoint != '':
+        shrinked_policy = np.load(os.path.join(args.shrink_checkpoint, 'shrinked_policy.npy'))
+        shrinked_acc = np.load(os.path.join(args.shrink_checkpoint, 'shrinked_accuracy.npy'))
+        # print('shrinked_policy:', shrinked_policy)
+        # print('shrinked_policy shape:', shrinked_policy.shape) # shrinked_policy shape: (100, 24)
+        # print('shrinked_acc:', shrinked_acc)
+        # print('shrinked_acc shape:', shrinked_acc.shape) # shrinked_acc shape: (100,)
+        max_index = np.argmax(shrinked_acc)
+        
+        # print('shrinked_policy[max_index, :12]:', shrinked_policy[max_index, :12])
+        # print('shrinked_policy[max_index, 12:]:',shrinked_policy[max_index, 12:])
 
-    logger.info(f"Start training for {args.epochs} epochs in sub-dataset{args.start_division}")
-    output_dir = Path(os.path.join(args.output_dir, f'sub-dataset{args.start_division}'))
-    os.makedirs(output_dir, exist_ok=True)
+        neuron_sparsity = shrinked_policy[max_index, :12]
+        head_sparsity = shrinked_policy[max_index, 12:]
 
-    # init tensorboard
-    writer = SummaryWriter(log_dir=output_dir) if get_rank() == 0 else None
+    else:
+        # modified: manually set neuron_spartisy and head_sparsity
+        neuron_sparsity = np.full(12, 0.75)
+        head_sparsity = np.full(12, 0.75)
 
-    start_time = time.time()
-    max_accuracy = 0.0
-    for epoch in range(args.start_epoch, args.epochs):
-        if args.distributed:
-            data_loader_train.sampler.set_epoch(epoch)
 
-        train_stats = train_one_epoch(model=model, criterion=criterion, data_loader=data_loader_train,
-                                      optimizer=optimizer, device=args.device, epoch=epoch, loss_scaler=loss_scaler,
-                                      log=logger, max_norm=args.clip_grad, model_ema=model_ema, mixup_fn=mixup_fn)
+    output_dir = f'output_imagenet/cifar100_div4/deit_base_distilled_patch16_224/distill_sub/lr8e-05-bs256-epochs10-grad1.0-wd0-wm5-gama0.2_0.1_0.3/sub-dataset{args.start_division}'
 
-        lr_scheduler.step(epoch)
-        if output_dir and dist_utils.is_main_process():
-            checkpoint_path = os.path.join(output_dir, 'checkpoint_temp.pth')
-            dist_utils.save_on_master({
-                'model': model_without_ddp.state_dict(),
-                'optimizer': optimizer.state_dict(),
-                'lr_scheduler': lr_scheduler.state_dict(),
-                'epoch': epoch,
-                'scaler': loss_scaler.state_dict(),
-                'args': args,
-            }, checkpoint_path)
-        if writer is not None:
-            writer.add_scalar('Train/loss', train_stats['loss'], epoch)
-            writer.add_scalar('Train/lr', train_stats['lr'], epoch)
-            if args.distillation_token:
-                writer.add_scalar('Train/cls_loss', train_stats['cls_loss'], epoch)
-                writer.add_scalar('Train/token_loss', train_stats['token_loss'], epoch)
-        logger.info(f"Epoch: {epoch}/{args.epochs} \t [Train] Loss: {train_stats['loss']:.4f} \t ")
 
-        test_stats = evaluate(data_loader=data_loader_val, model=model, device=args.device)
-        if writer is not None:
-            writer.add_scalar('Test/loss', test_stats['loss'], epoch)
-            writer.add_scalar('Test/Top1', test_stats['acc1'], epoch)
-            writer.add_scalar('Test/Top5', test_stats['acc5'], epoch)
-        logger.info(f"Epoch: {epoch}/{args.epochs} \t [Eval] Top-1: {test_stats['acc1']:.4f} \t "
-                    f"Top-5: {test_stats['acc5']:.4f} \t Loss: {test_stats['loss']:.4f} \t ")
+    loaded_neuron_mask_np = np.load(os.path.join(output_dir, 'neuron_mask.npy'))
+    # recover back to PyTorch tensor list：
+    loaded_neuron_mask = [torch.from_numpy(arr) for arr in loaded_neuron_mask_np]
+    loaded_head_mask_np = np.load(os.path.join(output_dir, 'head_mask.npy'))
+    loaded_head_mask = [torch.from_numpy(arr) for arr in loaded_head_mask_np]
+    print('loaded_neuron_mask:', loaded_neuron_mask)
+    print('loaded_head_mask:', loaded_head_mask)
+    
 
-        if max_accuracy < test_stats["acc1"]:
-            max_accuracy = test_stats["acc1"]
-            if args.output_dir and dist_utils.is_main_process():
-                model_checkpoint = os.path.join(output_dir, f"checkpoint.pth")
-                torch.save(model_without_ddp.state_dict(), model_checkpoint)
-                torch.save(args, os.path.join(output_dir, 'training_args.bin'))
-                with open(os.path.join(output_dir, 'result.txt'), 'w') as f:
-                    f.write(f'Final Accuracy: {max_accuracy}')
-                logger.info(f'Saving model in [PATH]: {output_dir}')
+    model_to_retest = create_model(
+        args.model,
+        pretrained=True,
+        checkpoint_path=os.path.join(output_dir, 'checkpoint.pth'),
+        num_classes=25,
+        drop_rate=args.drop,
+        drop_path_rate=args.drop_path,
+        drop_block_rate=None,
+    )
+    model_to_retest.to(args.device)
 
-        logger.info(f'Max accuracy: {max_accuracy:.2f}%')
+    mlp_neuron_shrink(model_to_retest, loaded_neuron_mask)
+    attn_head_shrink(model_to_retest, loaded_head_mask)
+    test_stats = evaluate(data_loader=data_loader_val, model=model_to_retest, device=args.device)
+    print(test_stats)
 
-        log_stats = {**{f'train_{k}': v for k, v in train_stats.items()},
-                     **{f'test_{k}': v for k, v in test_stats.items()},
-                     'epoch': epoch,
-                     'n_parameters': n_parameters}
-
-        if args.output_dir and dist_utils.is_main_process():
-            with (output_dir / "log_stats.txt").open("a") as f:
-                f.write(json.dumps(log_stats) + "\n")
-
-        total_time = time.time() - start_time
-        total_time_str = str(datetime.timedelta(seconds=int(total_time)))
-        logger.info(f'Epochs: {epoch} \t Training time: {total_time_str} ')
-
-    total_time = time.time() - start_time
-    total_time_str = str(datetime.timedelta(seconds=int(total_time)))
-    logger.info(f'Training time {total_time_str} on sub-dataset{args.start_division}')
-
+    compact_model = generate_compact_model(model_to_retest)
+    test_stats = evaluate(data_loader=data_loader_val, model=compact_model, device=args.device)
+    print(test_stats)
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser('DeViT training and evaluation script on sub-dataset', parents=[get_args_parser()])
+    parser = argparse.ArgumentParser('DeViT training and evaluation script', parents=[get_args_parser()])
     args = parser.parse_args()
-    args.name = f'lr{args.lr}-bs{args.batch_size}-epochs{args.epochs}-grad{args.clip_grad}' \
-                f'-wd{args.weight_decay}-wm{args.warmup_epochs}'
-    method = {'none': 'sub_no_distill', 'soft': 'distill_sub_soft', 'hard': 'distill_sub_hard'}
-    args.method = method[args.distillation_type] + '_token' if args.distillation_token else method[
-        args.distillation_type]
-    args.output_dir = os.path.join(args.output_dir, f'{args.dataset}_division{args.num_division}', f'{args.model}',
-                                   args.method, args.name)
-    if args.output_dir:
-        Path(args.output_dir).mkdir(parents=True, exist_ok=True)
     main(args)

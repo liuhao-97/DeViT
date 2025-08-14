@@ -206,22 +206,22 @@ def get_args_parser():
 
 
 def get_models(args, num_classes, num_sub, log):
-    # stu_nb = 1000 if args.model_path != '' else num_classes
+    stu_nb = 1000 if args.model_path != '' else num_classes
     model_path = args.model_path if args.finetune else None
     resize_dim = model_config[args.teacher_model]["embed_dim"] if args.distillation_token else None
     model = create_model(
         args.model,
         pretrained=True,
         checkpoint_path=model_path,
-        num_classes=25,
+        num_classes=stu_nb,
         resize_dim=resize_dim,
         drop_rate=args.drop,
         drop_path_rate=args.drop_path,
         drop_block_rate=None,
     )
     log.info(f'Create {args.model} model\n Load ckpt from [PATH]: {model_path}')
-    # if args.model_path != '':
-    #     model.reset_classifier(num_classes=num_classes)
+    if args.model_path != '':
+        model.reset_classifier(num_classes=num_classes)
     model.to(args.device)
 
     teacher_model = None
@@ -243,6 +243,252 @@ def get_models(args, num_classes, num_sub, log):
         teacher_model.eval()
 
     return model, teacher_model
+
+
+def rebuild_small_model_from_pruned(large_model: nn.Module, small_model:nn.Module,  neuron_mask: list, head_mask: list, num_classes: int) -> nn.Module:
+    """
+    根据剪枝掩码 (mask) 从一个大的 ViT 模型重建一个新的、结构更小的模型，并复制权重。
+
+    Args:
+        large_model (nn.Module): 经过训练和剪枝的大模型 (例如 deit_base_distilled_patch16_224)。
+        neuron_mask (list): MLP 神经元掩码列表。
+        head_mask (list): 注意力头掩码列表。
+        num_classes (int): 分类任务的类别数。
+
+    Returns:
+        nn.Module: 一个全新的、更小的模型实例，其中填充了来自大模型的权重。
+    """
+    print(" Starting to rebuild a smaller model from the pruned large model...")
+
+    # 1. 从掩码确定新模型的配置
+    # ----
+    # 将 mask 移到 CPU 以便使用 numpy/torch 的 CPU 操作
+    head_indices = torch.where(head_mask[0].cpu() == 1)[0]
+    neuron_indices = torch.where(neuron_mask[0].cpu() == 1)[0]
+
+    # 原始大模型配置 (deit_base)
+    large_dim = large_model.embed_dim
+    large_heads = large_model.blocks[0].attn.num_heads
+    mlp_hidden_dim_large = large_model.blocks[0].mlp.fc1.out_features
+    head_dim = large_dim // large_heads  # 每个头的维度，通常是 64
+
+    # 计算新小模型的配置
+    small_heads = len(head_indices)
+    small_dim = small_heads * head_dim
+    small_mlp_hidden_dim = len(neuron_indices)
+    
+    print("\nModel Configuration:")
+    print(f"  - Attention Heads: {large_heads} -> {small_heads}")
+    print(f"  - Embedding Dim: {large_dim} -> {small_dim}")
+    print(f"  - MLP Hidden Dim:  {mlp_hidden_dim_large} -> {small_mlp_hidden_dim}")
+
+    # 2. 创建小模型实例
+    # ----
+    # `dedeit_pruned` 模型在你的代码中被定义为 embed_dim=192, num_heads=3，这正好匹配
+    # 从 deit_base (embed_dim=768, num_heads=12) 剪枝9个头（保留3个）后的尺寸。
+    # small_model = create_model(
+    #     'dedeit_pruned',  # 使用预定义的小模型结构
+    #     num_classes=25,
+    #     drop_rate=args.drop,
+    #     drop_path_rate=args.drop_path,
+    #     drop_block_rate=None,
+    # )
+    
+    # 3. 准备权重迁移
+    # ----
+    large_state_dict = large_model.state_dict()
+    new_state_dict = small_model.state_dict()
+
+    # `embed_dim_indices` 是最重要的索引，用于切片所有与 embed_dim 相关的权重
+    embed_dim_indices = torch.cat([
+        torch.arange(idx * head_dim, (idx + 1) * head_dim) for idx in head_indices
+    ]).long()
+
+    # 4. 遍历权重并进行切片复制
+    # ----
+    print("\n🔄 Transferring weights...")
+    
+    # 辅助函数，用于获取层名中的 block 索引
+    def get_block_num(name):
+        return int(name.split('.')[1])
+
+    # CLS, Distill, Position Embeddings
+    new_state_dict['cls_token'] = large_state_dict['cls_token'][:, :, embed_dim_indices]
+    new_state_dict['dist_token'] = large_state_dict['dist_token'][:, :, embed_dim_indices]
+    new_state_dict['pos_embed'] = large_state_dict['pos_embed'][:, :, embed_dim_indices]
+
+    # Patch Embedding
+    new_state_dict['patch_embed.proj.weight'] = large_state_dict['patch_embed.proj.weight'][embed_dim_indices, ...]
+    new_state_dict['patch_embed.proj.bias'] = large_state_dict['patch_embed.proj.bias'][embed_dim_indices]
+
+    # Transformer Blocks
+    for i in range(len(small_model.blocks)):
+        # LayerNorms
+        new_state_dict[f'blocks.{i}.norm1.weight'] = large_state_dict[f'blocks.{i}.norm1.weight'][embed_dim_indices]
+        new_state_dict[f'blocks.{i}.norm1.bias'] = large_state_dict[f'blocks.{i}.norm1.bias'][embed_dim_indices]
+        new_state_dict[f'blocks.{i}.norm2.weight'] = large_state_dict[f'blocks.{i}.norm2.weight'][embed_dim_indices]
+        new_state_dict[f'blocks.{i}.norm2.bias'] = large_state_dict[f'blocks.{i}.norm2.bias'][embed_dim_indices]
+
+        # Attention QKV
+        qkv_row_indices = torch.cat([
+            embed_dim_indices,
+            embed_dim_indices + large_dim,
+            embed_dim_indices + 2 * large_dim
+        ]).long()
+        # weight: [out_features, in_features] -> [small_dim*3, small_dim]
+        w_qkv = large_state_dict[f'blocks.{i}.attn.qkv.weight']
+        new_state_dict[f'blocks.{i}.attn.qkv.weight'] = w_qkv[qkv_row_indices, :][:, embed_dim_indices]
+        # bias
+        b_qkv = large_state_dict[f'blocks.{i}.attn.qkv.bias']
+        new_state_dict[f'blocks.{i}.attn.qkv.bias'] = b_qkv[qkv_row_indices]
+
+        # Attention Proj
+        # weight: [out_features, in_features] -> [small_dim, small_dim]
+        w_proj = large_state_dict[f'blocks.{i}.attn.proj.weight']
+        new_state_dict[f'blocks.{i}.attn.proj.weight'] = w_proj[embed_dim_indices, :][:, embed_dim_indices]
+        # bias
+        b_proj = large_state_dict[f'blocks.{i}.attn.proj.bias']
+        new_state_dict[f'blocks.{i}.attn.proj.bias'] = b_proj[embed_dim_indices]
+
+        # MLP fc1
+        w_fc1 = large_state_dict[f'blocks.{i}.mlp.fc1.weight']
+        new_state_dict[f'blocks.{i}.mlp.fc1.weight'] = w_fc1[neuron_indices, :][:, embed_dim_indices]
+        b_fc1 = large_state_dict[f'blocks.{i}.mlp.fc1.bias']
+        new_state_dict[f'blocks.{i}.mlp.fc1.bias'] = b_fc1[neuron_indices]
+        
+        # MLP fc2
+        w_fc2 = large_state_dict[f'blocks.{i}.mlp.fc2.weight']
+        new_state_dict[f'blocks.{i}.mlp.fc2.weight'] = w_fc2[embed_dim_indices, :][:, neuron_indices]
+        b_fc2 = large_state_dict[f'blocks.{i}.mlp.fc2.bias']
+        new_state_dict[f'blocks.{i}.mlp.fc2.bias'] = b_fc2[embed_dim_indices]
+
+    # Final LayerNorm
+    new_state_dict['norm.weight'] = large_state_dict['norm.weight'][embed_dim_indices]
+    new_state_dict['norm.bias'] = large_state_dict['norm.bias'][embed_dim_indices]
+
+    # Classifier Heads
+    new_state_dict['head.weight'] = large_state_dict['head.weight'][:, embed_dim_indices]
+    new_state_dict['head.bias'] = large_state_dict['head.bias']
+    new_state_dict['head_dist.weight'] = large_state_dict['head_dist.weight'][:, embed_dim_indices]
+    new_state_dict['head_dist.bias'] = large_state_dict['head_dist.bias']
+
+    # 5. 加载新的权重字典
+    # ----
+    small_model.load_state_dict(new_state_dict)
+    print("\n Weight transfer complete. The new small model is ready!")
+    
+    return small_model
+
+
+
+def debug_weight_copy(large_model, small_model, neuron_mask, head_mask):
+    """
+    逐一比较小模型的每个参数，验证它是否与大模型参数切片后的结果完全相等。
+
+    Args:
+        large_model: 干净的、未经修改的大模型。
+        small_model: 重建后的小模型。
+        neuron_mask: MLP神经元掩码。
+        head_mask: 注意力头掩码。
+    """
+    print("\n" + "="*50)
+    print("🕵️  Verifying weight copy, parameter by parameter...")
+    print("="*50)
+
+    # 1. 准备所有需要的索引，这部分逻辑必须和 rebuild 函数完全一致
+    head_indices = torch.where(head_mask[0].cpu() == 1)[0]
+    neuron_indices = torch.where(neuron_mask[0].cpu() == 1)[0]
+    large_dim = large_model.embed_dim
+    large_heads = large_model.blocks[0].attn.num_heads
+    head_dim = large_dim // large_heads
+    embed_dim_indices = torch.cat(
+        [torch.arange(idx * head_dim, (idx + 1) * head_dim) for idx in head_indices]
+    ).long()
+    qkv_row_indices = torch.cat([
+        embed_dim_indices,
+        embed_dim_indices + large_dim,
+        embed_dim_indices + 2 * large_dim
+    ]).long()
+
+    # 2. 获取两个模型的 state_dict
+    large_state_dict = large_model.state_dict()
+    small_state_dict = small_model.state_dict()
+
+    mismatched_params = []
+
+    # 3. 遍历小模型的每一个参数进行校验
+    for name, small_param in small_state_dict.items():
+        if "num_batches_tracked" in name: # 跳过BN层的非参数项
+            continue
+            
+        if name not in large_state_dict:
+            print(f"❓ WARNING: Parameter '{name}' in small model not found in large model.")
+            continue
+
+        large_param = large_state_dict[name].cpu()
+        small_param_cpu = small_param.cpu()
+        large_param_sliced = None
+
+        # 4. 应用与 rebuild 函数相同的切片逻辑
+        if 'patch_embed.proj' in name:
+            large_param_sliced = large_param[embed_dim_indices, ...] if 'weight' in name else large_param[embed_dim_indices]
+        elif 'cls_token' in name or 'dist_token' in name or 'pos_embed' in name:
+            large_param_sliced = large_param[:, :, embed_dim_indices]
+        elif 'blocks' in name:
+            if 'norm' in name:
+                large_param_sliced = large_param[embed_dim_indices]
+            elif 'attn.qkv' in name:
+                if 'weight' in name:
+                    large_param_sliced = large_param[qkv_row_indices, :][:, embed_dim_indices]
+                else:  # bias
+                    large_param_sliced = large_param[qkv_row_indices]
+            elif 'attn.proj' in name:
+                if 'weight' in name:
+                    large_param_sliced = large_param[embed_dim_indices, :][:, embed_dim_indices]
+                else:  # bias
+                    large_param_sliced = large_param[embed_dim_indices]
+            elif 'mlp.fc1' in name:
+                if 'weight' in name:
+                    large_param_sliced = large_param[neuron_indices, :][:, embed_dim_indices]
+                else:  # bias
+                    large_param_sliced = large_param[neuron_indices]
+            elif 'mlp.fc2' in name:
+                if 'weight' in name:
+                    large_param_sliced = large_param[embed_dim_indices, :][:, neuron_indices]
+                else:  # bias
+                    large_param_sliced = large_param[embed_dim_indices]
+        elif 'norm' in name:  # Final norm
+            large_param_sliced = large_param[embed_dim_indices]
+        elif 'head' in name:
+            if 'weight' in name:
+                large_param_sliced = large_param[:, embed_dim_indices]
+            else:  # bias
+                large_param_sliced = large_param # bias is independent of input dim
+        
+        # 5. 进行比较
+        if large_param_sliced is not None:
+            # torch.equal 要求形状和数值都完全相等
+            if torch.equal(large_param_sliced, small_param_cpu):
+                print(f"✅ MATCH: '{name}'")
+            else:
+                print(f"❌ MISMATCH: '{name}'")
+                mismatched_params.append(name)
+        else:
+            print(f"INFO: No slicing rule for '{name}', assuming direct copy.")
+            if torch.equal(large_param, small_param_cpu):
+                 print(f"✅ MATCH: '{name}'")
+            else:
+                print(f"❌ MISMATCH: '{name}'")
+                mismatched_params.append(name)
+
+    print("\n" + "="*50)
+    if not mismatched_params:
+        print("🎉🎉🎉 All parameters verified successfully! Weight copy logic is CORRECT.")
+    else:
+        print("💔 Found mismatches in the following parameters:")
+        for name in mismatched_params:
+            print(f"  - {name}")
+    print("="*50 + "\n")
 
 
 def main(args):
@@ -323,15 +569,15 @@ def main(args):
             label_smoothing=args.smoothing, num_classes=division_num_classes)
 
     model, teacher_model = get_models(args, division_num_classes, args.start_division, logger)
-    print('student deit model:', model)
-    model_ema = None
-    if args.model_ema:
-        # Important to create EMA model after cuda(), DP wrapper, and AMP but before SyncBN and DDP wrapper
-        model_ema = ModelEma(
-            model,
-            decay=args.model_ema_decay,
-            device='cpu' if args.model_ema_force_cpu else '',
-            resume='')
+    small_model = create_model(
+        'dedeit_pruned',  # 使用预定义的小模型结构
+        num_classes=25,
+        drop_rate=args.drop,
+        drop_path_rate=args.drop_path,
+        drop_block_rate=None,
+    )
+    print('student dedeit model:', small_model)
+
 
     model_without_ddp = model
     if args.distributed:
@@ -342,7 +588,7 @@ def main(args):
 
     linear_scaled_lr = args.lr * args.batch_size * get_world_size() / 512.0
     args.lr = linear_scaled_lr
-    optimizer = create_optimizer(args, model_without_ddp)
+    optimizer = create_optimizer(args, small_model)
     loss_scaler = NativeScaler()
 
     lr_scheduler, _ = create_scheduler(args, optimizer)
@@ -361,29 +607,29 @@ def main(args):
     criterion = DistillLoss(base_criterion=criterion, distillation_type=args.distillation_type,
                             alpha=args.distillation_alpha, tau=args.distillation_tau)
 
-    if args.resume:
-        logger.info(f'Load resume checkpoint from [PATH]: {args.resume}')
-        if args.resume.startswith('https'):
-            checkpoint = torch.hub.load_state_dict_from_url(
-                args.resume, map_location='cpu', check_hash=True)
-        else:
-            checkpoint = torch.load(args.resume, map_location='cpu')
+    # if args.resume:
+    #     logger.info(f'Load resume checkpoint from [PATH]: {args.resume}')
+    #     if args.resume.startswith('https'):
+    #         checkpoint = torch.hub.load_state_dict_from_url(
+    #             args.resume, map_location='cpu', check_hash=True)
+    #     else:
+    #         checkpoint = torch.load(args.resume, map_location='cpu')
 
-        model_without_ddp.load_state_dict(checkpoint['model'])
-        if not args.eval and not args.finetune and \
-                'optimizer' in checkpoint and 'lr_scheduler' in checkpoint and 'epoch' in checkpoint:
-            optimizer.load_state_dict(checkpoint['optimizer'])
-            lr_scheduler.load_state_dict(checkpoint['lr_scheduler'])
-            args.start_epoch = checkpoint['epoch'] + 1
-            if args.model_ema:
-                dist_utils._load_checkpoint_for_ema(model_ema, checkpoint['model_ema'])
-            if 'scaler' in checkpoint:
-                loss_scaler.load_state_dict(checkpoint['scaler'])
+    #     model_without_ddp.load_state_dict(checkpoint['model'])
+    #     if not args.eval and not args.finetune and \
+    #             'optimizer' in checkpoint and 'lr_scheduler' in checkpoint and 'epoch' in checkpoint:
+    #         optimizer.load_state_dict(checkpoint['optimizer'])
+    #         lr_scheduler.load_state_dict(checkpoint['lr_scheduler'])
+    #         args.start_epoch = checkpoint['epoch'] + 1
+    #         if args.model_ema:
+    #             dist_utils._load_checkpoint_for_ema(model_ema, checkpoint['model_ema'])
+    #         if 'scaler' in checkpoint:
+    #             loss_scaler.load_state_dict(checkpoint['scaler'])
 
-    if args.eval:
-        test_stats = evaluate(data_loader_val, model, args.device)
-        logger.info(f"Accuracy of the network on the {len(test_dataset)} test images: {test_stats['acc1']:.1f}%")
-        return
+    # if args.eval:
+    #     test_stats = evaluate(data_loader_val, model, args.device)
+    #     logger.info(f"Accuracy of the network on the {len(test_dataset)} test images: {test_stats['acc1']:.1f}%")
+    #     return
 
     # load shrink
     if args.shrink_checkpoint != '':
@@ -452,15 +698,39 @@ def main(args):
             length = t.numel()  # or len(t) since they are 1D tensors
             print(f"head Tensor {i+1}: {count} ones out of {length} elements")
         attn_head_shrink(model_without_ddp, head_mask)
+    
+    rebuild_small_model = rebuild_small_model_from_pruned(
+        large_model=model_without_ddp,
+        small_model = small_model,
+        neuron_mask=neuron_mask,
+        head_mask=head_mask,
+        num_classes=division_num_classes
+    )
+    rebuild_small_model.to(args.device)
+    
 
+    debug_weight_copy(
+        large_model=model_without_ddp,
+        small_model=rebuild_small_model,
+        neuron_mask=neuron_mask,
+        head_mask=head_mask
+    )
+    model_ema = None
+    if args.model_ema:
+        # Important to create EMA model after cuda(), DP wrapper, and AMP but before SyncBN and DDP wrapper
+        model_ema = ModelEma(
+            rebuild_small_model,
+            decay=args.model_ema_decay,
+            device='cpu' if args.model_ema_force_cpu else '',
+            resume='')
     logger.info(f"Start training for {args.epochs} epochs in sub-dataset{args.start_division}")
     output_dir = Path(os.path.join(args.output_dir, f'sub-dataset{args.start_division}'))
     os.makedirs(output_dir, exist_ok=True)
     
-    # neuron_mask_np = np.stack([mask.cpu().numpy() for mask in neuron_mask])
-    # head_mask_np = np.stack([mask.cpu().numpy() for mask in head_mask])
-    # np.save(os.path.join(output_dir, 'neuron_mask'), neuron_mask_np)
-    # np.save(os.path.join(output_dir, 'head_mask'), head_mask_np)
+    neuron_mask_np = np.stack([mask.cpu().numpy() for mask in neuron_mask])
+    head_mask_np = np.stack([mask.cpu().numpy() for mask in head_mask])
+    np.save(os.path.join(output_dir, 'neuron_mask'), neuron_mask_np)
+    np.save(os.path.join(output_dir, 'head_mask'), head_mask_np)
 
     # init tensorboard
     writer = SummaryWriter(log_dir=output_dir) if get_rank() == 0 else None
@@ -481,7 +751,7 @@ def main(args):
         if args.distributed:
             data_loader_train.sampler.set_epoch(epoch)
 
-        train_stats = train_1epoch_qkv(model=model, teacher_model=teacher_model, criterion=criterion, args=args,
+        train_stats = train_1epoch_qkv(model=rebuild_small_model, teacher_model=teacher_model, criterion=criterion, args=args,
                                        data_loader=data_loader_train, optimizer=optimizer, device=args.device,
                                        epoch=epoch, loss_scaler=loss_scaler, log=logger, max_norm=args.clip_grad,
                                        model_ema=model_ema, mixup_fn=mixup_fn)
@@ -491,7 +761,7 @@ def main(args):
             checkpoint_paths = [output_dir / 'checkpoint_temp.pth']
             for checkpoint_path in checkpoint_paths:
                 dist_utils.save_on_master({
-                    'model': model_without_ddp.state_dict(),
+                    'model': rebuild_small_model.state_dict(),
                     'optimizer': optimizer.state_dict(),
                     'lr_scheduler': lr_scheduler.state_dict(),
                     'epoch': epoch,
@@ -500,7 +770,7 @@ def main(args):
                     'args': args,
                 }, checkpoint_path)
 
-        test_stats = evaluate(data_loader=data_loader_val, model=model, device=args.device)
+        test_stats = evaluate(data_loader=data_loader_val, model=rebuild_small_model, device=args.device)
         logger.info(f"Epoch: {epoch}/{args.epochs} \t [Train] Loss: {train_stats['loss']:.4f} \t ")
         logger.info(f"Epoch: {epoch}/{args.epochs} \t [Eval] Top-1: {test_stats['acc1']:.4f} \t "
                     f"Top-5: {test_stats['acc5']:.4f} \t Loss: {test_stats['loss']:.4f} \t ")
@@ -515,7 +785,7 @@ def main(args):
             max_accuracy = test_stats["acc1"]
             if args.output_dir and dist_utils.is_main_process():
                 model_checkpoint = os.path.join(output_dir, f"checkpoint.pth")
-                torch.save(model_without_ddp.state_dict(), model_checkpoint)
+                torch.save(rebuild_small_model.state_dict(), model_checkpoint)
                 torch.save(args, os.path.join(output_dir, 'training_args.bin'))
                 with open(os.path.join(output_dir, 'result.txt'), 'w') as f:
                     f.write(f'Final Accuracy: {max_accuracy}\n'

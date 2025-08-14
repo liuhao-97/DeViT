@@ -12,7 +12,7 @@ from utils.losses import feature_relation_loss
 from timm.data import Mixup
 from timm.utils import accuracy, ModelEma
 from timm.utils.clip_grad import dispatch_clip_grad
-
+import numpy as np
 
 @torch.no_grad()
 def evaluate(data_loader, model, device):
@@ -66,15 +66,39 @@ def train_1epoch_qkv(model: torch.nn.Module, teacher_model: torch.nn.Module, cri
             samples, targets = mixup_fn(samples, targets)
 
         with torch.cuda.amp.autocast():
-            if args.distillation_inter:
+            if args.distillation_inter: # True
+                # print(f"Using distillation_inter: {args.distillation_inter}") 
                 outputs = model(samples, output_qkv=True)
                 logits = outputs['output']
                 qkvs = outputs['qkv']
+
+                ## type(outputs): <class 'dict'>, type(logits): <class 'tuple'>, type(qkvs):<class 'list'>                                                                  
+                # print(f'type(outputs): {type(outputs)}, type(logits): {type(logits)}, type(qkvs):{type(qkvs)}') 
+                
+                ## student output logits 0 shape: torch.Size([256,25]) student output logits 1 shape: torch.Size([256,25])
+                # for ttt, tensor in enumerate(logits):
+                #     print(f"student output logits {ttt} shape: {tensor.size()}") 
+                
+                ## type(qkvs[0]):<class 'tuple'>, type(qkvs[0][0]):<class 'torch.Tensor'>
+                # print(f'type(qkvs[0]):{type(qkvs[0])}, type(qkvs[0][0]):{type(qkvs[0][0])}')
+                # print(f"student output qkvs length: {len(qkvs)}") # 12
+                # print(f"student output qkvs[0] length: {len(qkvs[0])}") # 3
+                # print(f"student output qkvs[0][0] tensor size: {qkvs[0][0].size()}")  # torch.Size([256, 6, 198, 64])  
+
                 with torch.no_grad():
                     teacher_outputs = teacher_model(samples, output_qkv=True)
                     teacher_logits = teacher_outputs['output']
                     teacher_qkvs = teacher_outputs['qkv']
-
+                    ## type(teacher_outputs): <class 'dict'>, type(teacher_logits): <class 'torch.Tensor'>, type(teacher_qkvs):<class 'list'>
+                    # print(f'type(teacher_outputs): {type(teacher_outputs)}, type(teacher_logits): {type(teacher_logits)}, type(teacher_qkvs):{type(teacher_qkvs)}')
+                    ## teacher output logits 0-255 shape: torch.Size([25])
+                    # for ttt, tensor in enumerate(teacher_logits):
+                    #     print(f"teacher output logits {ttt} shape: {tensor.size()}")
+                    ## type(teacher_qkvs[0]):<class 'tuple'>, type(teacher_qkvs[0][0]):<class 'torch.Tensor'>
+                    # print(f'type(teacher_qkvs[0]):{type(teacher_qkvs[0])}, type(teacher_qkvs[0][0]):{type(teacher_qkvs[0][0])}')
+                    # print(f"teacher output qkvs length: {len(teacher_qkvs)}") # 12
+                    # print(f"teacher output qkvs[0] length: {len(teacher_qkvs[0])}") # 3
+                    # print(f"teacher output qkvs[0][0] tensor size: {teacher_qkvs[0][0].size()}") # torch.Size([256, 6, 198, 64])
                 # cls loss
                 cls_loss = criterion(outputs=logits, teacher_outputs=teacher_logits, labels=targets)
 

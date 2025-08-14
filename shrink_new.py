@@ -35,6 +35,11 @@ from utils.logger import create_logger
 from utils.losses import DistillLoss
 from utils.samplers import RASampler
 
+from models.de_vit_neck import VisionTransformer as neck_VisionTransformer
+from functools import partial
+from utils.pred_utils import ProgressMeter, accuracy, AverageMeter
+from torch.cuda.amp import autocast as autocast
+from torch.cuda.amp import GradScaler as GradScaler
 
 def get_args_parser():
     parser = argparse.ArgumentParser('DeViT training and evaluation script', add_help=False)
@@ -45,7 +50,7 @@ def get_args_parser():
                         help='path where to save, empty for no saving')
 
     # Model parameters
-    parser.add_argument('--model', default='dedeit', type=str, metavar='MODEL',
+    parser.add_argument('--model', default='deit_base_distilled_patch16_224', type=str, metavar='MODEL',
                         help='Name of model to train')
     parser.add_argument('--model-path', type=str, default='')
     parser.add_argument('--input-size', default=224, type=int, help='images input size')
@@ -191,12 +196,13 @@ def get_args_parser():
     parser.add_argument('--dist_url', default='env://', help='url used to set up distributed training')
 
     # shrinking related
+    parser.add_argument('--embedding_shrinking', action='store_true', default=False)
     parser.add_argument('--neuron_shrinking', action='store_true', default=False)
     parser.add_argument('--head_shrinking', action='store_true', default=False)
     parser.add_argument('--neuron_sparsity', type=float, default=0.)
     parser.add_argument('--head_sparsity', type=float, default=0.)
 
-    parser.add_argument('--classifier-choose', type=int, default=12, help='number of layers to shrink')
+    # parser.add_argument('--classifier-choose', type=int, default=12, help='number of layers to shrink')
 
     parser.add_argument('--shrink_ratio', type=float, default=0.3, help='shrinking ratio')
     parser.add_argument('--bound', type=float, default=0.5, help='upper bound')
@@ -295,6 +301,7 @@ def main(args):
         drop_block_rate=None,
     )
     model.load_state_dict(model_ckpt)
+    print(f'load model from {model_path}')
     
     print('args.num_classes', args.num_classes)
 
@@ -397,7 +404,7 @@ def main(args):
     criterion = DistillLoss(
         criterion, args.distillation_type, args.distillation_alpha, args.distillation_tau
     )
-    print(model_without_ddp)
+    # print(model_without_ddp)
     print('args.resume', args.resume)
     if args.resume:
         logger.info(f'Load checkpoint from [PATH]: {args.resume}')
@@ -420,25 +427,167 @@ def main(args):
                 if 'scaler' in checkpoint:
                     loss_scaler.load_state_dict(checkpoint['scaler'])
     
-    neuron_rank = None
-    head_rank = None
+
+    # output_dir = Path(os.path.join(args.output_dir, f'sub-dataset{args.start_division}'))
+    os.makedirs(output_dir, exist_ok=True)
+
+    if args.embedding_shrinking:
+        kls = []
+        source_model_path = os.path.join(args.model_path, f'sub-dataset{args.start_division}', 'checkpoint.pth')
+        source_checkpoint = torch.load(source_model_path, map_location='cpu')
+        source_state_dict = source_checkpoint['model'] if 'model' in source_checkpoint else source_checkpoint
+
+        source_model = create_model(
+            args.model,
+            num_classes=args.num_classes,
+            drop_rate=args.drop,
+            drop_path_rate=args.drop_path,
+            drop_block_rate=None,
+        )
+        source_model.load_state_dict(source_state_dict)
+        source_model.cuda()
+        source_model.eval()
+        print(f'load model from {source_model_path}')
+        
+        test_stats = evaluate(data_loader_val, source_model, device)
+        logger.info(f"Accuracy of the network on the {len(test_dataset)} test images: {test_stats['acc1']:.4f}%")
+        
+
+        candidate_index = range(768) # need to modify
+        for delete_ind in candidate_index:
+
+            target_model_new_dict  = {}
+            for k, v in source_state_dict.items():
+                if "qkv.weight" in k or "head.weight" in k or "mlp.fc1.weight" in k or 'head_dist.weight' in k :
+                    new_v = v[:,torch.arange(v.size(1))!=delete_ind]     
+                elif "cls_token" in k or "pos_embed" in k or 'dist_token' in k:
+                    new_v = v[:,:,torch.arange(v.size(2))!=delete_ind]
+                elif "patch_embed" in k or "norm" in k  or "fc2" in k or "attn.proj" in k:
+                    new_v = v[torch.arange(v.size(0))!=delete_ind]
+                else:
+                    new_v = v
+                
+                target_model_new_dict[k] = new_v
+            
+            target_model = neck_VisionTransformer(patch_size=16, embed_dim=767, depth=12, num_heads=12, mlp_ratio=4, qkv_bias=True,
+                                                  norm_layer=partial(nn.LayerNorm, eps=1e-6), distilled=True)
+            target_model.reset_classifier(num_classes=25)
+            target_model.load_state_dict(target_model_new_dict)
+            target_model.cuda()
+            target_model.eval()
+
+                
+            batch_time = AverageMeter('Time', ':6.3f')
+            losses = AverageMeter('Loss', ':.4e')
+            top1 = AverageMeter('Acc@1', ':6.3f')
+            top5 = AverageMeter('Acc@5', ':6.3f')
+            kl = AverageMeter('KL', ':6.3f')
+            cos = AverageMeter('Cosine', ':6.3f')
+
+            progress = ProgressMeter(
+                len(data_loader_train),
+                [batch_time, losses, top1, top5],
+                prefix='Test: ')
+
+
+            kl_meter = AverageMeter('KL', ':6.3f')
+            with torch.no_grad():
+                for i, (images, target) in enumerate(data_loader_train):
+                    images = images.cuda( non_blocking=True)
+                    # target = target.cuda( non_blocking=True)
+
+                    with autocast():
+                        output = target_model(images)    
+                        print(f'output shape: {output.shape}')
+                        source_output = source_model(images)
+                        print(f'source_output shape: {source_output.shape}')
+
+                        logsoftmax = torch.nn.LogSoftmax(dim=1).cuda()
+                        softmax = torch.nn.Softmax(dim=1).cuda()
+                        distil_loss = torch.sum(
+                            torch.sum(softmax(source_output) * (logsoftmax(source_output) - logsoftmax(output)), dim=1))
+                    kl_meter.update(distil_loss.item(), 1)
+                        
+            total_kl_for_dim = kl_meter.sum
+            print(f"Total KL divergence for pruned dim {delete_ind}: {total_kl_for_dim}")
+            kls.append(total_kl_for_dim)
+
+        with open(output_dir / "Deit_base_12_neck_768_kl_5k.txt", 'a') as f:
+            for s in kls:
+                f.write(str(s) + '\n')
+
+        sorted_id = sorted(range(len(kls)), key=lambda k: kls[k])
+        with open(output_dir / "Deit_base_12_neck_768_kl_5k_192.txt", 'w') as f:
+            for s in sorted_id[:576]:
+                f.write(str(s) + '\n')
+                
+
+    # modified: manually set neuron_spartisy and head_sparsity
+    neuron_sparsity = np.full(12, 4/6)
+    head_sparsity = np.full(12, 4/6)
 
     if args.neuron_shrinking:
-        neuron_rank = mlp_neuron_rank(model_without_ddp, data_loader_train)
-        logger.info(f'Finish ranking neuron.')
-    # print(model_without_ddp)
+        logger.info('Start shrink neuron')
+        print('mlp_neuron_rank(model_without_ddp, data_loader_train):',mlp_neuron_rank(model_without_ddp, data_loader_train))
+        # modified to generate unified mask 
+        neuron_mask = mlp_neuron_mask(model_without_ddp, neuron_sparsity, mlp_neuron_rank(model_without_ddp, data_loader_train))
+        mlp_hidden_dim = model_without_ddp.blocks[0].mlp.fc1.out_features
+        print(f'mlp_hidden_dim:', mlp_hidden_dim)
+        # 调用新函数生成一致的掩码
+        # neuron_mask = generate_consistent_masks(
+        #     model=model_without_ddp, 
+        #     data_loader=data_loader_train,
+        #     rank_function=mlp_neuron_rank,
+        #     sparsity_ratios=neuron_sparsity,
+        #     num_elements=mlp_hidden_dim,
+        #     device=device
+        # )
+        
+        print(f'neuron_mask:', neuron_mask)
+        for i, t in enumerate(neuron_mask):
+            count = torch.sum(t == 1.).item()
+            length = t.numel()  # or len(t) since they are 1D tensors
+            print(f"neuron Tensor {i+1}: {count} ones out of {length} elements")
+        # mlp_neuron_shrink(model_without_ddp, neuron_mask)
+    
+        neuron_mask_np = np.stack([mask.cpu().numpy() for mask in neuron_mask])
+        np.save(os.path.join(output_dir, 'neuron_mask'), neuron_mask_np)
+
+
+
     if args.head_shrinking:
-        head_rank = attn_head_rank(model_without_ddp, data_loader_train)
-        logger.info(f'Finish ranking head.')
-    print(model_without_ddp)
-    xp, yp = model_shrink(model=model, data_loader_val=data_loader_val, layer=args.classifier_choose,
-                          shrink_ratio=args.shrink_ratio, neuron_rank=neuron_rank, head_rank=head_rank, device=device,
-                          population=args.population, lb=0, ub=args.bound, log=logger)
-    print(xp)
-    print(yp)
-    print(f'xp: {xp.shape}, yp: {yp.shape}')
-    np.save(os.path.join(output_dir, 'shrinked_policy'), xp)
-    np.save(os.path.join(output_dir, 'shrinked_accuracy'), yp)
+        logger.info('Start shrink head')
+        print('attn_head_rank(model_without_ddp, data_loader_train):', attn_head_rank(model_without_ddp, data_loader_train))
+         # modified to generate unified mask 
+        head_mask = attn_head_mask(model_without_ddp, head_sparsity, attn_head_rank(model_without_ddp, data_loader_train))
+        num_heads = model_without_ddp.blocks[0].attn.num_heads
+        print(f'num_heads:', num_heads)
+        # 调用新函数生成一致的掩码
+        # head_mask = generate_consistent_masks(
+        #     model=model_without_ddp,
+        #     data_loader=data_loader_train,
+        #     rank_function=attn_head_rank,
+        #     sparsity_ratios=head_sparsity,
+        #     num_elements=num_heads,
+        #     device=device
+        # )
+        print(f'head_mask:', head_mask)
+        for i, t in enumerate(head_mask):
+            count = torch.sum(t == 1.).item()
+            length = t.numel()  # or len(t) since they are 1D tensors
+            print(f"head Tensor {i+1}: {count} ones out of {length} elements")
+        # attn_head_shrink(model_without_ddp, head_mask)
+
+        head_mask_np = np.stack([mask.cpu().numpy() for mask in head_mask])
+        np.save(os.path.join(output_dir, 'head_mask'), head_mask_np)
+
+    logger.info(f"Start training for {args.epochs} epochs in sub-dataset{args.start_division}")
+    
+    
+
+
+
+
 
     logger.info(f'Finish shrinking on sub-dataset{args.start_division}')
 
